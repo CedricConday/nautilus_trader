@@ -68,6 +68,13 @@ pub const HYPERLIQUID_CHAIN_ID: u64 = 421614;
 /// shape published on the message bus, so the index travels with the instrument.
 pub const ASSET_INDEX_INFO_KEY: &str = "asset_index";
 
+/// Key carrying the venue max leverage on a perpetual's `info` map.
+///
+/// The margin rates derived from this value are the tier 0 rates, so a caller
+/// sizing a position large enough to cross into a higher tier needs the venue
+/// figure the rates came from.
+pub const MAX_LEVERAGE_INFO_KEY: &str = "max_leverage";
+
 // Error message substrings for detecting specific rejection reasons
 pub const HYPERLIQUID_POST_ONLY_WOULD_MATCH: &str =
     "Post only order would have immediately matched";

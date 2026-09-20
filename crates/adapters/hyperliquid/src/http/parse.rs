@@ -38,7 +38,7 @@ use super::models::{
 };
 use crate::{
     common::{
-        consts::{ASSET_INDEX_INFO_KEY, HYPERLIQUID_VENUE},
+        consts::{ASSET_INDEX_INFO_KEY, HYPERLIQUID_VENUE, MAX_LEVERAGE_INFO_KEY},
         converters::hyperliquid_time_in_force_to_nautilus,
         enums::{
             HyperliquidFillDirection, HyperliquidOrderStatus as HyperliquidOrderStatusEnum,
@@ -771,6 +771,30 @@ fn info_with_asset_index(info: Option<Params>, asset_index: u32) -> Params {
     info
 }
 
+/// Returns the tier 0 `(margin_init, margin_maint)` rates for a perpetual.
+///
+/// Hyperliquid margins a position at its own leverage: the initial margin is
+/// `position_size * mark_price / leverage`, and the maintenance margin "is currently set
+/// to half of the initial margin at max leverage"
+/// (<https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margining>). The margin tier
+/// table states the same relation per tier as
+/// `maintenance_margin_rate(tier = n) = (initial margin rate at max leverage at tier n) / 2`
+/// (<https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margin-tiers>), so the rates
+/// for the first tier follow from `maxLeverage` in the perp meta.
+///
+/// Returns `None` when the venue publishes no usable max leverage, leaving the
+/// instrument defaults in place rather than inventing a rate.
+fn perp_margin_rates(max_leverage: Option<u32>) -> Option<(Decimal, Decimal)> {
+    let max_leverage = Decimal::from(max_leverage.filter(|leverage| *leverage > 0)?);
+
+    // Each rate is taken from the venue figure rather than one from the other, so neither
+    // inherits the other's rounding when the quotient does not terminate.
+    let margin_init = Decimal::ONE.checked_div(max_leverage)?;
+    let margin_maint = Decimal::ONE.checked_div(max_leverage.checked_mul(Decimal::TWO)?)?;
+
+    Some((margin_init, margin_maint))
+}
+
 /// Converts a single Hyperliquid instrument definition into a Nautilus `InstrumentAny`.
 ///
 /// Returns `None` if the conversion fails (e.g., unsupported market type).
@@ -835,6 +859,12 @@ pub fn create_instrument_from_def(
                 get_currency(settlement_code)
             };
             let min_notional = Some(min_order_notional(quote_currency)?);
+            let (margin_init, margin_maint) = perp_margin_rates(def.max_leverage).unzip();
+
+            let mut info = info_with_asset_index(None, def.asset_index);
+            if let Some(max_leverage) = def.max_leverage {
+                info.insert(MAX_LEVERAGE_INFO_KEY.to_string(), json!(max_leverage));
+            }
 
             Some(InstrumentAny::CryptoPerpetual(
                 CryptoPerpetual::builder()
@@ -849,7 +879,9 @@ pub fn create_instrument_from_def(
                     .price_increment(price_increment)
                     .size_increment(size_increment)
                     .maybe_min_notional(min_notional)
-                    .info(info_with_asset_index(None, def.asset_index))
+                    .maybe_margin_init(margin_init)
+                    .maybe_margin_maint(margin_maint)
+                    .info(info)
                     // Identical to ts_init for now
                     .ts_event(ts_init)
                     .ts_init(ts_init)
@@ -1471,6 +1503,97 @@ mod tests {
         // deserialization rather than by parse_recent_trade.
         let json = r#"{"coin":"BTC","side":"B","px":"not-a-number","sz":"0.5","time":1769916000000,"tid":1}"#;
         assert!(serde_json::from_str::<HyperliquidRecentTrade>(json).is_err());
+    }
+
+    #[rstest]
+    #[case(Some(40), Some(dec!(0.025)), Some(dec!(0.0125)))]
+    #[case(Some(25), Some(dec!(0.04)), Some(dec!(0.02)))]
+    #[case(Some(5), Some(dec!(0.2)), Some(dec!(0.1)))]
+    #[case(Some(1), Some(dec!(1)), Some(dec!(0.5)))]
+    #[case(None, None, None)]
+    #[case(Some(0), None, None)]
+    fn test_perp_margin_rates(
+        #[case] max_leverage: Option<u32>,
+        #[case] expected_init: Option<Decimal>,
+        #[case] expected_maint: Option<Decimal>,
+    ) {
+        let (margin_init, margin_maint) = perp_margin_rates(max_leverage).unzip();
+
+        assert_eq!(margin_init, expected_init);
+        assert_eq!(margin_maint, expected_maint);
+    }
+
+    #[rstest]
+    fn test_perp_margin_rates_for_a_repeating_rate() {
+        // 3x is a real leverage on this venue and neither rate terminates, so each is taken
+        // from `max_leverage` directly rather than one from the other.
+        let (margin_init, margin_maint) = perp_margin_rates(Some(3)).unzip();
+
+        assert_eq!(margin_init, Some(Decimal::ONE / dec!(3)));
+        assert_eq!(margin_maint, Some(Decimal::ONE / dec!(6)));
+    }
+
+    #[rstest]
+    fn test_create_instrument_from_def_perp_sets_margins_from_max_leverage() {
+        // Hyperliquid publishes `maxLeverage` per asset and sets the maintenance
+        // margin to half the initial margin at that leverage, so a margin account
+        // must reserve `notional / max_leverage` for a tier 0 position.
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let defs = parse_perp_instruments(&meta, 0).unwrap();
+
+        let expected = [
+            ("BTC-USD-PERP", 40_u64, dec!(0.025), dec!(0.0125)),
+            ("ETH-USD-PERP", 25, dec!(0.04), dec!(0.02)),
+            ("ATOM-USD-PERP", 5, dec!(0.2), dec!(0.1)),
+        ];
+        assert_eq!(defs.len(), expected.len());
+
+        for (def, (symbol, max_leverage, margin_init, margin_maint)) in
+            defs.iter().zip(expected.iter())
+        {
+            let instrument = create_instrument_from_def(def, UnixNanos::default()).unwrap();
+
+            match instrument {
+                InstrumentAny::CryptoPerpetual(perp) => {
+                    assert_eq!(perp.id.symbol.as_str(), *symbol);
+                    assert_eq!(perp.margin_init, *margin_init);
+                    assert_eq!(perp.margin_maint, *margin_maint);
+                    assert_eq!(
+                        perp.info.as_ref().unwrap().get_u64(MAX_LEVERAGE_INFO_KEY),
+                        Some(*max_leverage),
+                    );
+                }
+                other => panic!("Expected CryptoPerpetual, was {other:?}"),
+            }
+        }
+    }
+
+    #[rstest]
+    fn test_create_instrument_from_def_perp_without_max_leverage_keeps_defaults() {
+        let meta = PerpMeta {
+            universe: vec![PerpAsset {
+                name: "NOLEV".to_string(),
+                sz_decimals: 2,
+                max_leverage: None,
+                ..Default::default()
+            }],
+            margin_tables: vec![],
+            collateral_token: None,
+        };
+        let defs = parse_perp_instruments(&meta, 0).unwrap();
+
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.margin_init, Decimal::ZERO);
+                assert_eq!(perp.margin_maint, Decimal::ZERO);
+                let info = perp.info.as_ref().unwrap();
+                assert_eq!(info.get_u64(MAX_LEVERAGE_INFO_KEY), None);
+                assert_eq!(info.get_u64(ASSET_INDEX_INFO_KEY), Some(0));
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
     }
 
     #[rstest]
