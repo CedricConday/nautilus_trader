@@ -42,7 +42,9 @@ use super::{
     urisafe_instrument_id,
 };
 use crate::{
-    catalog::types::{CatalogType, parquet_catalog_type_path_prefix},
+    catalog::types::{
+        CatalogType, parquet_catalog_type_path_prefixes, parquet_catalog_type_table_stem,
+    },
     common::arrow::{empty_display_batch_with_identifier, validate_catalog_schema},
 };
 
@@ -591,8 +593,7 @@ impl ParquetDataCatalog {
         let identifiers = identifier.map(|value| vec![value]);
         let files_list = self.query_files(catalog_type, identifiers, start, end)?;
         let mut record_batches = Vec::new();
-        let table_prefix =
-            make_sql_safe_identifier(&parquet_catalog_type_path_prefix(catalog_type));
+        let table_prefix = make_sql_safe_identifier(&parquet_catalog_type_table_stem(catalog_type));
 
         if optimize_file_loading {
             // Deterministic registration order so equal-ts_init tie order is reproducible.
@@ -721,8 +722,7 @@ impl ParquetDataCatalog {
         self.register_remote_object_store()?;
 
         let files_list = self.query_files(catalog_type, identifiers, start, end)?;
-        let table_prefix =
-            make_sql_safe_identifier(&parquet_catalog_type_path_prefix(catalog_type));
+        let table_prefix = make_sql_safe_identifier(&parquet_catalog_type_table_stem(catalog_type));
         let mut identifiers = Vec::new();
 
         for (index, directory) in parent_directories(&files_list).into_iter().enumerate() {
@@ -924,8 +924,29 @@ impl ParquetDataCatalog {
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<String>> {
-        let data_cls = parquet_catalog_type_path_prefix(catalog_type);
-        let data_cls = data_cls.as_ref();
+        // Take the identifiers once so every prefix shares them without cloning per directory.
+        let identifiers = identifiers.map(Vec::into_boxed_slice);
+        let mut files = Vec::new();
+        for data_cls in parquet_catalog_type_path_prefixes(catalog_type) {
+            files.extend(self.query_prefix_files(
+                data_cls.as_ref(),
+                identifiers.as_deref(),
+                start,
+                end,
+            )?);
+        }
+        files.sort();
+
+        Ok(files)
+    }
+
+    fn query_prefix_files(
+        &self,
+        data_cls: &str,
+        identifiers: Option<&[String]>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<Vec<String>> {
         let mut files = Vec::new();
 
         let start_u64 = start.map(|s| s.as_u64());
@@ -999,7 +1020,6 @@ impl ParquetDataCatalog {
         for file_path in file_paths {
             files.push(self.path_for_query_list(&file_path));
         }
-        files.sort();
 
         Ok(files)
     }
@@ -1136,7 +1156,16 @@ impl ParquetDataCatalog {
         &self,
         catalog_type: &CatalogType,
     ) -> anyhow::Result<Vec<String>> {
-        let base_dir = self.make_path(&parquet_catalog_type_path_prefix(catalog_type), None)?;
+        let mut file_paths = Vec::new();
+        for data_cls in parquet_catalog_type_path_prefixes(catalog_type) {
+            file_paths.extend(self.prefix_file_list(data_cls.as_ref())?);
+        }
+
+        Ok(file_paths)
+    }
+
+    fn prefix_file_list(&self, data_cls: &str) -> anyhow::Result<Vec<String>> {
+        let base_dir = self.make_path(data_cls, None)?;
 
         let list_result = self.list_objects(&base_dir)?;
 
@@ -1212,8 +1241,9 @@ impl ParquetDataCatalog {
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<String>> {
-        let data_cls = parquet_catalog_type_path_prefix(catalog_type);
-        let data_cls = data_cls.as_ref();
+        let has_bar_prefix = parquet_catalog_type_path_prefixes(catalog_type)
+            .iter()
+            .any(|data_cls| is_parquet_bar_prefix(data_cls.as_ref()));
         let mut filtered_paths = file_paths;
 
         // Apply identifier filtering if provided
@@ -1250,7 +1280,7 @@ impl ParquetDataCatalog {
                 })
                 .collect();
 
-            if exact_match_file_paths.is_empty() && is_parquet_bar_prefix(data_cls) {
+            if exact_match_file_paths.is_empty() && has_bar_prefix {
                 // Partial match of instrument_ids in bar_types for bars
                 filtered_paths.retain(|file_path| {
                     let path_parts: Vec<&str> = file_path.split('/').collect();

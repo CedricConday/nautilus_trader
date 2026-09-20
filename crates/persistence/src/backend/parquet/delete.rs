@@ -280,7 +280,13 @@ impl ParquetDataCatalog {
             NautilusDataType::Custom { type_name } => {
                 self.delete_custom_data_range(type_name, identifier, start, end)
             }
-            other => anyhow::bail!("Unsupported data type: {other}"),
+            other @ NautilusDataType::Instrument => {
+                anyhow::bail!("Unsupported data type: {other}")
+            }
+            #[cfg(feature = "defi")]
+            other @ NautilusDataType::Defi => {
+                anyhow::bail!("Unsupported data type: {other}")
+            }
         }
     }
 

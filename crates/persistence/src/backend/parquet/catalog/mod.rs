@@ -90,7 +90,7 @@ use nautilus_model::{
         OrderBookDelta, OrderBookDepth, QuoteTick, TradeTick, close::InstrumentClose,
         is_monotonically_increasing_by_init,
     },
-    instruments::{Instrument, InstrumentAny, NautilusInstrumentType},
+    instruments::{Instrument, InstrumentAny},
 };
 use nautilus_serialization::arrow::{
     ArrowSchemaProvider, DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch,
@@ -100,7 +100,6 @@ use nautilus_serialization::arrow::{
 };
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use serde::Serialize;
-use strum::IntoEnumIterator;
 
 use crate::{
     backend::parquet::{
@@ -699,22 +698,6 @@ impl CatalogReader for ParquetDataCatalog {
             where_clause,
             ..
         } = query.clone();
-
-        if data_type == NautilusDataType::Instrument {
-            let mut metadata = Vec::new();
-            for instrument_type in NautilusInstrumentType::iter() {
-                metadata.extend(Self::query_metadata(
-                    self,
-                    &CatalogType::Instrument(instrument_type),
-                    identifiers.clone(),
-                    start,
-                    end,
-                    where_clause.as_deref(),
-                )?);
-            }
-            metadata.sort_by_key(|entry| entry.first_ts_init);
-            return Ok(metadata);
-        }
 
         Self::query_metadata(
             self,

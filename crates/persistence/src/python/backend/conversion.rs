@@ -71,32 +71,16 @@ pub(crate) fn catalog_record_type_from_py(
         .map_err(|_| to_pytype_err("record_type must be NautilusRecordType"))
 }
 
-pub(crate) fn catalog_data_type_from_py(
-    data_type: &Bound<'_, PyAny>,
-) -> PyResult<NautilusDataType> {
+/// Extracts a [`NautilusDataType`] selector from its Python wrapper.
+///
+/// # Errors
+///
+/// Returns a `TypeError` if `data_type` is not a `NautilusDataType`.
+pub fn catalog_data_type_from_py(data_type: &Bound<'_, PyAny>) -> PyResult<NautilusDataType> {
     data_type
         .extract::<PyRef<'_, PyNautilusDataType>>()
         .map(|data_type| data_type.inner())
         .map_err(|_| to_pytype_err("data_type must be NautilusDataType"))
-}
-
-/// Extracts a query data type, rejecting the ambiguous instrument data family.
-///
-/// Instrument reads name one class through the instrument query methods, so a query cannot
-/// select every instrument class at once.
-pub(crate) fn catalog_query_data_type_from_py(
-    data_type: &Bound<'_, PyAny>,
-) -> PyResult<NautilusDataType> {
-    let data_type = catalog_data_type_from_py(data_type)?;
-
-    if data_type == NautilusDataType::Instrument {
-        return Err(to_pytype_err(
-            "instrument queries require a NautilusInstrumentType passed to the instrument query \
-             methods, not the Instrument data type",
-        ));
-    }
-
-    Ok(data_type)
 }
 
 /// Catalog type argument of the Python bindings.
@@ -125,7 +109,7 @@ impl_stub_type!(
 
 pub(crate) fn catalog_type_from_py(catalog_type: &Bound<'_, PyAny>) -> PyResult<CatalogType> {
     if let Ok(data_type) = catalog_type.extract::<PyRef<'_, PyNautilusDataType>>() {
-        return CatalogType::from_data_type(data_type.inner()).map_err(to_pytype_err);
+        return Ok(CatalogType::from(data_type.inner()));
     }
 
     if let Ok(record_type) = catalog_type.extract::<PyRef<'_, PyNautilusRecordType>>() {

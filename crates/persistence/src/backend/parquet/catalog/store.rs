@@ -30,7 +30,7 @@ use super::{
     remote_store_root_url, timestamps_to_filename, urisafe_instrument_id,
 };
 use crate::{
-    catalog::types::{CatalogType, parquet_catalog_type_path_prefix},
+    catalog::types::{CatalogType, parquet_catalog_type_path_prefixes},
     common::paths::normalize_path_separators,
 };
 
@@ -97,10 +97,27 @@ impl ParquetDataCatalog {
         start: UnixNanos,
         end: UnixNanos,
     ) -> anyhow::Result<()> {
-        let directory =
-            self.make_path(&parquet_catalog_type_path_prefix(catalog_type), identifier)?;
+        let prefixes = parquet_catalog_type_path_prefixes(catalog_type);
 
-        self.extend_file_name_in_directory(&directory, start, end)
+        if let [data_cls] = prefixes.as_slice() {
+            let directory = self.make_path(data_cls.as_ref(), identifier)?;
+            return self.extend_file_name_in_directory(&directory, start, end);
+        }
+
+        // The aggregate instrument family spans every class directory, so extend the one that
+        // already stores `identifier` rather than inventing a class for it.
+        for data_cls in &prefixes {
+            let directory = self.make_path(data_cls.as_ref(), identifier)?;
+            if !self.get_directory_intervals(&directory)?.is_empty() {
+                return self.extend_file_name_in_directory(&directory, start, end);
+            }
+        }
+
+        anyhow::bail!(
+            "Cannot extend file name for {catalog_type}: no instrument class holds {}; \
+             name the class with a NautilusInstrumentType",
+            identifier.unwrap_or("any identifier"),
+        )
     }
 
     pub(super) fn extend_file_name_in_directory(
@@ -235,7 +252,18 @@ impl ParquetDataCatalog {
     ///
     /// Returns an error if directory listing fails.
     pub fn list_instruments(&self, catalog_type: &CatalogType) -> anyhow::Result<Vec<String>> {
-        let data_type = parquet_catalog_type_path_prefix(catalog_type);
+        let mut instruments = Vec::new();
+        for data_type in parquet_catalog_type_path_prefixes(catalog_type) {
+            instruments.extend(self.list_prefix_instruments(data_type.as_ref())?);
+        }
+        // The same identifier can live under more than one instrument class.
+        instruments.sort();
+        instruments.dedup();
+
+        Ok(instruments)
+    }
+
+    fn list_prefix_instruments(&self, data_type: &str) -> anyhow::Result<Vec<String>> {
         self.execute_async(|| async {
             let prefix = ObjectPath::from(format!("data/{data_type}/"));
             let mut stream = self.object_store.list(Some(&prefix));
@@ -280,11 +308,31 @@ impl ParquetDataCatalog {
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<String>> {
         let mut all_files = Vec::new();
+        for data_cls in parquet_catalog_type_path_prefixes(catalog_type) {
+            all_files.extend(self.list_prefix_files_with_criteria(
+                data_cls.as_ref(),
+                identifiers,
+                start,
+                end,
+            )?);
+        }
+
+        Ok(all_files)
+    }
+
+    fn list_prefix_files_with_criteria(
+        &self,
+        data_cls: &str,
+        identifiers: Option<&[String]>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut all_files = Vec::new();
 
         let start_u64 = start.map(|s| s.as_u64());
         let end_u64 = end.map(|e| e.as_u64());
 
-        let base_dir = self.make_path(&parquet_catalog_type_path_prefix(catalog_type), None)?;
+        let base_dir = self.make_path(data_cls, None)?;
 
         // Use recursive listing to match Python's glob behavior
         let list_result = self.list_objects(&base_dir)?;

@@ -246,7 +246,7 @@ class ParquetDataCatalog:
         start: int | None = None,
         end: int | None = None,
         where_clause: str | None = None,
-        instrument_type: typing.Any | None = None,
+        instrument_type: model.NautilusInstrumentType | str | None = None,
     ) -> list[typing.Any]: ...
     def query_instrument_arrow_bytes(
         self,
@@ -254,7 +254,7 @@ class ParquetDataCatalog:
         start: int | None = None,
         end: int | None = None,
         where_clause: str | None = None,
-        instrument_type: typing.Any | None = None,
+        instrument_type: model.NautilusInstrumentType | str | None = None,
     ) -> bytes: ...
     def query_instrument_arrow_stream(
         self,
@@ -262,7 +262,7 @@ class ParquetDataCatalog:
         start: int | None = None,
         end: int | None = None,
         where_clause: str | None = None,
-        instrument_type: typing.Any | None = None,
+        instrument_type: model.NautilusInstrumentType | str | None = None,
     ) -> typing.Any: ...
     def extend_file_name(
         self,

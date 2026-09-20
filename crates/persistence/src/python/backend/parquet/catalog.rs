@@ -58,8 +58,8 @@ use crate::{
         backend::{
             PyCatalogType, arrow_ipc_batches, arrow_ipc_data_schema, arrow_ipc_record_schema,
             arrow_record_batches_from_pybytes, catalog_data_type_from_py,
-            catalog_metadata_to_pydict, catalog_query_data_type_from_py,
-            catalog_record_type_from_py, to_pyio_err, write_record_params_from_py,
+            catalog_metadata_to_pydict, catalog_record_type_from_py, to_pyio_err,
+            write_record_params_from_py,
         },
         config::py_instrument_type_from_any,
     },
@@ -545,6 +545,7 @@ impl PyParquetDataCatalog {
         start: Option<u64>,
         end: Option<u64>,
         where_clause: Option<&str>,
+        #[gen_stub(override_type(type_repr = "model.NautilusInstrumentType | str | None"))]
         instrument_type: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let instrument_type = instrument_type
@@ -584,6 +585,7 @@ impl PyParquetDataCatalog {
         start: Option<u64>,
         end: Option<u64>,
         where_clause: Option<&str>,
+        #[gen_stub(override_type(type_repr = "model.NautilusInstrumentType | str | None"))]
         instrument_type: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyBytes>> {
         let instrument_type = instrument_type
@@ -622,6 +624,7 @@ impl PyParquetDataCatalog {
         start: Option<u64>,
         end: Option<u64>,
         where_clause: Option<&str>,
+        #[gen_stub(override_type(type_repr = "model.NautilusInstrumentType | str | None"))]
         instrument_type: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let instrument_type = instrument_type
@@ -1018,7 +1021,7 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         where_clause: Option<&str>,
     ) -> PyResult<Py<PyDict>> {
-        let catalog_data_type = catalog_query_data_type_from_py(data_type)?;
+        let catalog_data_type = catalog_data_type_from_py(data_type)?;
         let metadata = py
             .detach(|| {
                 CatalogReader::query_metadata(
@@ -1055,7 +1058,7 @@ impl PyParquetDataCatalog {
         display: bool,
         as_of: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyBytes>> {
-        let catalog_data_type = catalog_query_data_type_from_py(data_type)?;
+        let catalog_data_type = catalog_data_type_from_py(data_type)?;
         reject_parquet_as_of(as_of)?;
         let query = CatalogQuery::new(catalog_data_type.clone())
             .with_identifiers(identifiers)
@@ -1098,7 +1101,7 @@ impl PyParquetDataCatalog {
         display: bool,
         as_of: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let catalog_data_type = catalog_query_data_type_from_py(data_type)?;
+        let catalog_data_type = catalog_data_type_from_py(data_type)?;
         reject_parquet_as_of(as_of)?;
         let query = CatalogQuery::new(catalog_data_type.clone())
             .with_identifiers(identifiers)
