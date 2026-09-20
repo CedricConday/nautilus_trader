@@ -65,7 +65,7 @@ use nautilus_model::{
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
-        TradeId, TraderId, Venue,
+        TradeId, TraderId, Venue, VenueOrderId,
     },
     instruments::{
         CryptoPerpetual, Instrument, InstrumentAny,
@@ -4589,6 +4589,137 @@ fn test_exec_engine_stop_rejects_in_flight_commands_without_reentering(
             .any(|event| matches!(event, OrderEventAny::Rejected(rejected)
             if rejected.client_order_id == order.client_order_id())),
         "the engine must publish the rejection it processed",
+    );
+}
+
+/// An order the cache reports `ACCEPTED` that no matching engine holds - a node restarted against
+/// a cache database, where positions and the account come back but the order side did not - is put
+/// back into the engine the client builds for that instrument, so it can be cancelled and can fill.
+#[rstest]
+fn test_cache_open_order_is_restored_into_a_new_matching_engine(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+) {
+    let (context, mut rx) = setup_channel_context(trader_id, account_id, venue, &instrument, None);
+
+    // The state a restart leaves behind: the order is in the cache and ACCEPTED, and this client
+    // has never seen it, so no matching engine exists for its instrument.
+    let ts = context.test_clock.borrow().timestamp_ns();
+    let restored = resting_limit(&instrument, "O-RESTORED-1", "100.00", ts);
+    let submitted = TestOrderEventStubs::submitted(&restored, context.client.account_id());
+    let accepted = TestOrderEventStubs::accepted(
+        &restored,
+        context.client.account_id(),
+        VenueOrderId::from("V-RESTORED-1"),
+    );
+    {
+        let mut cache = context.cache.borrow_mut();
+        cache
+            .add_order(
+                restored.clone(),
+                None,
+                Some(context.client.client_id()),
+                false,
+            )
+            .unwrap();
+        cache.update_order(&submitted).unwrap();
+        cache.update_order(&accepted).unwrap();
+    }
+    assert_eq!(
+        cached_status(&context.cache, &restored),
+        OrderStatus::Accepted
+    );
+    assert_eq!(context.client.matching_engine_count(), 0);
+
+    // Market data for the instrument builds the engine
+    let quote = create_quote_tick(instrument.id(), 1000.0, 1001.0);
+    context.client.process_quote_tick(&quote).unwrap();
+    assert_eq!(context.client.matching_engine_count(), 1);
+
+    context
+        .client
+        .cancel_order(cancel_command(
+            context.client.client_id(),
+            trader_id,
+            &restored,
+            ts,
+        ))
+        .unwrap();
+
+    let kinds: Vec<&str> = drain_order_events(&mut rx)
+        .iter()
+        .map(order_event_kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["canceled"],
+        "the restored order must cancel, not come back as not found: {kinds:?}",
+    );
+}
+
+/// After a restart an order the strategy had already marked `PENDING_CANCEL` is still resting at
+/// the venue, and it is the one a strategy most needs resolved: `Strategy::cancel_order` writes
+/// that status into the cache before the command reaches the client, so excluding it by status
+/// would leave the very cancel that #5023 is about rejected as "not found".
+#[rstest]
+fn test_pending_cancel_cache_order_is_restored_after_a_restart(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+) {
+    let (context, mut rx) = setup_channel_context(trader_id, account_id, venue, &instrument, None);
+
+    let ts = context.test_clock.borrow().timestamp_ns();
+    let restored = resting_limit(&instrument, "O-RESTORED-PENDING-1", "100.00", ts);
+    let submitted = TestOrderEventStubs::submitted(&restored, context.client.account_id());
+    let accepted = TestOrderEventStubs::accepted(
+        &restored,
+        context.client.account_id(),
+        VenueOrderId::from("V-RESTORED-PENDING-1"),
+    );
+    {
+        let mut cache = context.cache.borrow_mut();
+        cache
+            .add_order(
+                restored.clone(),
+                None,
+                Some(context.client.client_id()),
+                false,
+            )
+            .unwrap();
+        cache.update_order(&submitted).unwrap();
+        cache.update_order(&accepted).unwrap();
+    }
+    mark_pending_cancel(&context.cache, &restored, trader_id, ts);
+    assert_eq!(
+        cached_status(&context.cache, &restored),
+        OrderStatus::PendingCancel,
+    );
+
+    let quote = create_quote_tick(instrument.id(), 1000.0, 1001.0);
+    context.client.process_quote_tick(&quote).unwrap();
+
+    context
+        .client
+        .cancel_order(cancel_command(
+            context.client.client_id(),
+            trader_id,
+            &restored,
+            ts,
+        ))
+        .unwrap();
+
+    let kinds: Vec<&str> = drain_order_events(&mut rx)
+        .iter()
+        .map(order_event_kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["canceled"],
+        "a cache order left pending a cancel by a previous run must still be cancellable: {kinds:?}",
     );
 }
 

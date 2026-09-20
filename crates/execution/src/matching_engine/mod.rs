@@ -1307,6 +1307,87 @@ impl OrderMatchingEngine {
         self.cached_filled_qty.len()
     }
 
+    /// Restores an already open order into the matching core.
+    ///
+    /// A client that reloads its open orders from a cache database after a restart uses this to
+    /// put them back in the book. The order keeps its venue order ID, status and filled quantity,
+    /// and no order event is generated: the order was accepted before this engine existed, so
+    /// re-announcing it would report an acceptance that did not just happen.
+    ///
+    /// Restoring an order the core already holds is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order is for another instrument, or if it is not open.
+    pub fn restore_open_order(
+        &mut self,
+        order: &OrderAny,
+        account_id: AccountId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            order.instrument_id() == self.instrument.id(),
+            "Cannot restore order {} for {}: this matching engine is for {}",
+            order.client_order_id(),
+            order.instrument_id(),
+            self.instrument.id(),
+        );
+        anyhow::ensure!(
+            order.is_open(),
+            "Cannot restore order {}: status is {}, expected an open order",
+            order.client_order_id(),
+            order.status(),
+        );
+
+        if self.core.order_exists(order.client_order_id()) {
+            return Ok(());
+        }
+
+        // Every fill resolves the order through the cache, so an order this engine cannot read
+        // back would rest here and then fail, or panic, on its first match.
+        {
+            let mut cache = self.cache.borrow_mut();
+            let Some(mut cached) = cache.order_mut(&order.client_order_id()) else {
+                anyhow::bail!(
+                    "Cannot restore order {}: not in the cache",
+                    order.client_order_id(),
+                );
+            };
+
+            // A passive order resting at the venue is a maker, which is what this engine marks an
+            // order as when it first accepts one. Without it a restored order matches but its
+            // fills carry no liquidity side.
+            if cached
+                .liquidity_side()
+                .is_none_or(|side| side == LiquiditySide::NoLiquiditySide)
+            {
+                cached.set_liquidity_side(LiquiditySide::Maker);
+            }
+        }
+
+        // Index the account the same way `process_order` does, so a node whose only orders are
+        // restored ones can still resolve an account for their fills.
+        self.account_ids.insert(order.trader_id(), account_id);
+
+        // Carry what the order has already filled. The fill path caps a fill at the leaves only
+        // when this is present, so a partially filled order restored without it could overfill.
+        if order.filled_qty().non_zero() {
+            self.cached_filled_qty
+                .insert(order.client_order_id(), order.filled_qty());
+        }
+
+        // Seed the queue estimate the same way accepting a passive order does, so a restored
+        // order does not jump ahead of the depth already resting at its price.
+        if let Some(price) = order.price() {
+            self.snapshot_queue_position(order, price);
+        }
+
+        let match_info = Self::matching_core_entry(order);
+        self.track_post_match_order(order);
+        self.core.add_order(match_info);
+
+        Ok(())
+    }
+
     #[must_use]
     pub const fn get_core(&self) -> &OrderMatchingCore {
         &self.core

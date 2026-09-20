@@ -953,7 +953,50 @@ impl SandboxInner {
             }
 
             engine.set_inflight_orders(self.inflight_orders.clone());
+            self.restore_open_orders(&mut engine, instrument_id);
             self.matching_engines.insert(instrument_id, engine);
+        }
+    }
+
+    /// Puts the instrument's resting cache orders back into a freshly built matching engine.
+    ///
+    /// The sandbox emits no order status reports, so reconciliation cannot repair the gap from
+    /// outside: after a restart with a cache database the cache reports an order `ACCEPTED` while
+    /// no engine holds it, and the order can then neither fill nor be cancelled. Positions and
+    /// the account already come back from the cache; this brings the order side with them.
+    ///
+    /// An order whose submit this client is still holding, in the latency queue and so not yet
+    /// received by the venue, is skipped: inserting it would answer for a command the engine has
+    /// yet to process. Every other open order is restored, including one pending a cancel or
+    /// update and a triggered stop resting as a limit, because after a restart those are resting
+    /// at the venue too and are exactly the ones a strategy cannot otherwise resolve.
+    fn restore_open_orders(&self, engine: &mut OrderMatchingEngine, instrument_id: InstrumentId) {
+        let orders: Vec<OrderAny> = self
+            .cache
+            .borrow()
+            .orders_open(None, Some(&instrument_id), None, None, None)
+            .into_iter()
+            .filter(|order| !self.inflight_orders.contains(order.client_order_id()))
+            .map(|order| order.cloned())
+            .collect();
+
+        if orders.is_empty() {
+            return;
+        }
+
+        let mut restored = 0_usize;
+        for order in &orders {
+            match engine.restore_open_order(order, self.account_id) {
+                Ok(()) => restored += 1,
+                Err(e) => log::warn!(
+                    "Cannot restore open order {} for {instrument_id}: {e}",
+                    order.client_order_id(),
+                ),
+            }
+        }
+
+        if restored > 0 {
+            log::info!("Restored {restored} cache-open order(s) for {instrument_id}");
         }
     }
 

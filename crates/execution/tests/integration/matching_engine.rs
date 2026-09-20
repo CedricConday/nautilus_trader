@@ -61,7 +61,7 @@ use nautilus_model::{
     orderbook::OrderBook,
     orders::{
         Order, OrderAny, OrderCore, OrderTestBuilder,
-        stubs::{TestOrderEventStubs, TestOrderStubs},
+        stubs::{OrderFilledTestBuilder, TestOrderEventStubs, TestOrderStubs},
     },
     position::Position,
     stubs::TestDefault,
@@ -2674,6 +2674,336 @@ fn test_passive_stop_limit_rekeys_to_limit_after_trigger(
 
     assert_eq!(filled.client_order_id, client_order_id);
     assert_eq!(filled.liquidity_side, LiquiditySide::Maker);
+}
+
+#[rstest]
+fn test_restore_open_order_holds_it_without_reannouncing_acceptance(
+    instrument_eth_usdt: InstrumentAny,
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+) {
+    // A client reloading its open orders after a restart restores them into a fresh engine.
+    // The venue accepted them before this engine existed, so no event is due.
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine_l2 = get_order_matching_engine_l2(
+        instrument_eth_usdt.clone(),
+        None,
+        Some(cache.clone()),
+        None,
+        None,
+    );
+
+    let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+    let limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1495.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+    let accepted_order = TestOrderStubs::make_accepted_order(&limit_order);
+    assert_eq!(accepted_order.status(), OrderStatus::Accepted);
+    cache
+        .borrow_mut()
+        .add_order(accepted_order.clone(), None, None, false)
+        .unwrap();
+
+    engine_l2
+        .restore_open_order(&accepted_order, account_id)
+        .unwrap();
+
+    assert!(engine_l2.order_exists(client_order_id));
+    assert_eq!(engine_l2.get_open_bid_orders().len(), 1);
+    assert_eq!(
+        engine_l2.get_open_bid_orders().first().unwrap().limit_price,
+        Some(Price::from("1495.00")),
+    );
+    assert!(get_order_event_handler_messages(&order_event_handler).is_empty());
+
+    // Restoring the same order again is a no-op rather than a duplicate resting order
+    engine_l2
+        .restore_open_order(&accepted_order, account_id)
+        .unwrap();
+    assert_eq!(engine_l2.get_open_bid_orders().len(), 1);
+}
+
+#[rstest]
+fn test_restore_open_order_can_then_be_canceled(instrument_eth_usdt: InstrumentAny) {
+    // Before the restore path existed a cache-open order could never be cancelled after a
+    // restart: the engine had never seen it, so the cancel came back "not found" forever.
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+    let mut engine_l2 = get_order_matching_engine_l2(
+        instrument_eth_usdt.clone(),
+        None,
+        Some(cache.clone()),
+        None,
+        None,
+    );
+
+    let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+    let limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1495.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+    let account_id = limit_order.account_id().unwrap();
+    let accepted_order = TestOrderStubs::make_accepted_order(&limit_order);
+    cache
+        .borrow_mut()
+        .add_order(accepted_order.clone(), None, None, false)
+        .unwrap();
+
+    engine_l2
+        .restore_open_order(&accepted_order, account_id)
+        .unwrap();
+
+    let cancel_command = CancelOrder::new(
+        TraderId::test_default(),
+        Some(ClientId::from("CLIENT-001")),
+        StrategyId::test_default(),
+        instrument_eth_usdt.id(),
+        client_order_id,
+        accepted_order.venue_order_id(),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None, // correlation_id
+    );
+    engine_l2.process_cancel(&cancel_command, account_id);
+
+    let saved_messages = get_order_event_handler_messages(&order_event_handler);
+    assert_eq!(saved_messages.len(), 1);
+    match saved_messages.first().unwrap() {
+        OrderEventAny::Canceled(canceled) => assert_eq!(canceled.client_order_id, client_order_id),
+        other => panic!("Expected OrderCanceled event, was {other:?}"),
+    }
+    assert!(!engine_l2.order_exists(client_order_id));
+}
+
+#[rstest]
+fn test_restore_open_order_fills_when_its_price_trades(
+    instrument_eth_usdt: InstrumentAny,
+    account_id: AccountId,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+    let mut engine_l2 = get_order_matching_engine_l2(
+        instrument_eth_usdt.clone(),
+        None,
+        Some(cache.clone()),
+        None,
+        None,
+    );
+
+    let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+    let limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1495.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+    let accepted_order = TestOrderStubs::make_accepted_order(&limit_order);
+    cache
+        .borrow_mut()
+        .add_order(accepted_order.clone(), None, None, false)
+        .unwrap();
+
+    engine_l2
+        .restore_open_order(&accepted_order, account_id)
+        .unwrap();
+
+    // Market trades down through the resting bid
+    let orderbook_delta_sell = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("1494.00"),
+            Quantity::from("1.000"),
+            1,
+        ))
+        .build();
+    engine_l2
+        .process_order_book_delta(&orderbook_delta_sell)
+        .unwrap();
+
+    let saved_messages = get_order_event_handler_messages(&order_event_handler);
+    assert!(
+        saved_messages
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(filled)
+                if filled.client_order_id == client_order_id)),
+        "Expected the restored order to fill, events were {saved_messages:?}",
+    );
+}
+
+#[rstest]
+fn test_restore_open_order_rejects_an_order_missing_from_the_cache(
+    instrument_eth_usdt: InstrumentAny,
+    account_id: AccountId,
+) {
+    // Every fill resolves the order through the cache, so restoring one the engine cannot read
+    // back would rest it here and then fail on its first match.
+    let mut engine_l2 =
+        get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, None, None);
+
+    let limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1495.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+        .submit(true)
+        .build();
+    let accepted_order = TestOrderStubs::make_accepted_order(&limit_order);
+
+    assert!(
+        engine_l2
+            .restore_open_order(&accepted_order, account_id)
+            .is_err()
+    );
+    assert_eq!(engine_l2.get_open_orders().len(), 0);
+}
+
+#[rstest]
+fn test_restore_partially_filled_order_fills_only_its_leaves(instrument_eth_usdt: InstrumentAny) {
+    // The fill path caps a fill at the leaves only when the engine knows what the order has
+    // already filled, so a restored partially filled order must bring that quantity with it.
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+    let mut engine_l2 = get_order_matching_engine_l2(
+        instrument_eth_usdt.clone(),
+        None,
+        Some(cache.clone()),
+        None,
+        None,
+    );
+
+    let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+    let limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1495.00"))
+        .quantity(Quantity::from("10.000"))
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+    let account_id = limit_order.account_id().unwrap();
+    let mut resting_order = TestOrderStubs::make_accepted_order(&limit_order);
+    resting_order
+        .apply(
+            OrderFilledTestBuilder::new(&resting_order, &instrument_eth_usdt)
+                .last_qty(Quantity::from("4.000"))
+                .last_px(Price::from("1495.00"))
+                .liquidity_side(LiquiditySide::Maker)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(resting_order.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(resting_order.filled_qty(), Quantity::from("4.000"));
+    cache
+        .borrow_mut()
+        .add_order(resting_order.clone(), None, None, false)
+        .unwrap();
+
+    engine_l2
+        .restore_open_order(&resting_order, account_id)
+        .unwrap();
+
+    // Liquidity crossing the resting bid, more than its remaining leaves
+    let orderbook_delta_sell = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("1494.00"),
+            Quantity::from("10.000"),
+            1,
+        ))
+        .build();
+    engine_l2
+        .process_order_book_delta(&orderbook_delta_sell)
+        .unwrap();
+
+    let fills: Vec<_> = get_order_event_handler_messages(&order_event_handler)
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(filled) if filled.client_order_id == client_order_id => {
+                Some(filled)
+            }
+            _ => None,
+        })
+        .collect();
+    let filled_after_restore: f64 = fills.iter().map(|fill| fill.last_qty.as_f64()).sum();
+
+    assert_eq!(
+        filled_after_restore, 6.0,
+        "a restored order must fill only its remaining leaves, fills were {fills:?}",
+    );
+    assert!(
+        fills
+            .iter()
+            .all(|fill| fill.liquidity_side == LiquiditySide::Maker),
+        "a restored resting order fills as a maker",
+    );
+}
+
+#[rstest]
+fn test_restore_open_order_rejects_another_instrument(
+    instrument_eth_usdt: InstrumentAny,
+    account_id: AccountId,
+) {
+    let mut engine_l2 = get_order_matching_engine_l2(instrument_eth_usdt, None, None, None, None);
+
+    let limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(InstrumentId::from("BTCUSDT-PERP.BINANCE"))
+        .side(OrderSide::Buy)
+        .price(Price::from("1495.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+        .submit(true)
+        .build();
+    let accepted_order = TestOrderStubs::make_accepted_order(&limit_order);
+
+    assert!(
+        engine_l2
+            .restore_open_order(&accepted_order, account_id)
+            .is_err()
+    );
+    assert_eq!(engine_l2.get_open_orders().len(), 0);
+}
+
+#[rstest]
+fn test_restore_open_order_rejects_a_closed_order(
+    instrument_eth_usdt: InstrumentAny,
+    account_id: AccountId,
+) {
+    let mut engine_l2 =
+        get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, None, None);
+
+    let limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1495.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+        .submit(true)
+        .build();
+    let filled_order =
+        TestOrderStubs::make_filled_order(&limit_order, &instrument_eth_usdt, LiquiditySide::Maker);
+    assert!(filled_order.is_closed());
+
+    assert!(
+        engine_l2
+            .restore_open_order(&filled_order, account_id)
+            .is_err()
+    );
+    assert_eq!(engine_l2.get_open_orders().len(), 0);
 }
 
 #[rstest]
