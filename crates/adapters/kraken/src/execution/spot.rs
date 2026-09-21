@@ -64,9 +64,10 @@ use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::{
-    command_failure_from_cancel_error, command_failure_from_modify_error,
-    command_failure_from_spot_batch_error, command_failure_from_spot_batch_item,
-    command_failure_from_spot_cancel_error, command_failure_from_submit_error,
+    batch_cancel_from_cancel_all, cancels_for_cancel_all, command_failure_from_cancel_error,
+    command_failure_from_modify_error, command_failure_from_spot_batch_error,
+    command_failure_from_spot_batch_item, command_failure_from_spot_cancel_error,
+    command_failure_from_submit_error,
 };
 use crate::{
     common::{
@@ -1606,87 +1607,46 @@ impl ExecutionClient for KrakenSpotExecutionClient {
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
 
-        if cmd.order_side.is_none() {
-            log::debug!("Canceling all orders: instrument_id={instrument_id} (bulk)");
-
-            let http = self.http.clone();
-
-            self.spawn_task("cancel_all_orders", async move {
-                if let Err(e) = http.inner.cancel_all_orders().await {
-                    match command_failure_from_cancel_error(e) {
-                        CommandFailure::NotSent(reason) => {
-                            log::warn!("Cancel-all failed local validation: {reason}");
-                        }
-                        CommandFailure::Ambiguous(reason)
-                        | CommandFailure::VenueRejected(reason) => {
-                            log::warn!(
-                                "Cancel-all ambiguous failure, awaiting reconciliation: {reason}"
-                            );
-                        }
-                    }
-                }
-                Ok(())
-            });
-
-            return Ok(());
-        }
-
         log::debug!(
             "Canceling all orders: instrument_id={instrument_id}, side={:?}",
             cmd.order_side
         );
 
-        let orders_to_cancel: Vec<_> = {
+        // Kraken Spot's account-wide `CancelAll` ignores the requested instrument, so an unsided
+        // request would reach orders on every other instrument. Cancel the selected orders by ID
+        // instead, through the same batch-cancel command an explicit batch uses.
+        let selected = {
             let cache = self.core.cache();
-            let open_orders = cache.orders_open(None, Some(&instrument_id), None, None, None);
-
-            open_orders
-                .into_iter()
-                .filter(|order| Some(order.order_side()) == cmd.order_side)
-                .filter_map(|order| {
-                    Some((
-                        order.venue_order_id()?,
-                        order.client_order_id(),
-                        order.instrument_id(),
-                        order.strategy_id(),
-                    ))
-                })
-                .collect()
+            cancels_for_cancel_all(&cache, &cmd, self.core.account_id)
         };
 
-        let account_id = self.core.account_id;
+        // `CancelOrderBatch` matches its `orders` entries against venue order IDs and user
+        // references only, so an order the venue has not acknowledged yet cannot be named in one.
+        // Reporting it as requested would be worse than leaving it: say so and leave it resting.
+        let (cancels, unacknowledged): (Vec<_>, Vec<_>) = selected
+            .into_iter()
+            .partition(|cancel| cancel.venue_order_id.is_some());
 
-        for (venue_order_id, client_order_id, order_instrument_id, strategy_id) in orders_to_cancel
-        {
-            let http = self.http.clone();
-            let emitter = self.emitter.clone();
-            let clock = self.clock;
-
-            self.spawn_task("cancel_order_by_side", async move {
-                if let Err(failure) = cancel_order_for_spot(
-                    &http,
-                    account_id,
-                    order_instrument_id,
-                    Some(client_order_id),
-                    Some(venue_order_id),
-                )
-                .await
-                {
-                    handle_cancel_failure(
-                        &emitter,
-                        clock,
-                        strategy_id,
-                        order_instrument_id,
-                        client_order_id,
-                        Some(venue_order_id),
-                        failure,
-                    );
-                }
-                Ok(())
-            });
+        if !unacknowledged.is_empty() {
+            log::warn!(
+                "Cannot cancel {} order(s) for {instrument_id} without a venue order ID: {}",
+                unacknowledged.len(),
+                unacknowledged
+                    .iter()
+                    .map(|cancel| cancel.client_order_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
         }
 
-        Ok(())
+        if cancels.is_empty() {
+            // The cache is the only source of orders here, so an empty selection may mean the
+            // venue holds orders this client has not reconciled rather than none at all.
+            log::warn!("No cached open orders to cancel for {instrument_id}");
+            return Ok(());
+        }
+
+        self.batch_cancel_orders(batch_cancel_from_cancel_all(&cmd, cancels))
     }
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {

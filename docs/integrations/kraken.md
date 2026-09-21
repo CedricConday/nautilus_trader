@@ -348,12 +348,28 @@ time rather than silently coercing them.
 | Batch Cancel | ✓    | ✓       | Auto-chunks into batches of 50.                        |
 
 :::note
-**Cancel all orders**:
+**Cancel all orders** is always scoped to the requested instrument:
 
-- With no side filter, Spot cancels all open orders across all symbols, while
-  Futures cancels all orders for the requested instrument.
-- With a side filter, both clients select matching cached orders for the
-  requested instrument and cancel them individually.
+- Spot selects the matching open orders from the cache and cancels them by ID,
+  through the same batch-cancel path as an explicit batch cancel, with or
+  without a side filter. Kraken's account-wide `CancelAll` is not used, because
+  it would also cancel orders on instruments the command never named.
+- Futures cancels all orders for the requested instrument through the venue's
+  symbol-scoped bulk cancellation when no side is given, and selects the
+  matching cached orders and cancels them by ID when a side is given, since the
+  venue's bulk cancellation takes no side.
+- Because the selection comes from the cache, orders the client has not
+  reconciled are not reached; an empty selection is logged at warning level
+  rather than passing silently.
+- Orders belonging to another account are never selected, and a Spot order the
+  venue has not acknowledged yet is skipped with a warning, since Kraken's
+  batch cancellation matches venue order IDs and user references only.
+- The selected orders go out in batches of 50 and follow the same transport
+  rules as an explicit batch cancel, including `use_ws_trade`, which cancels
+  each selected order over the WebSocket and reports its own outcome. Over
+  HTTP, Spot's batch response carries a count rather than per-order results, so
+  it is left to reconciliation rather than reported as per-order outcomes;
+  Futures reports the per-order results its batch response carries.
 
 :::
 

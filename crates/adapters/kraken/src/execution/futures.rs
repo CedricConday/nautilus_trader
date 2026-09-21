@@ -57,9 +57,9 @@ use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    command_failure_from_cancel_error, command_failure_from_futures_batch_error,
-    command_failure_from_futures_batch_item, command_failure_from_modify_error,
-    command_failure_from_submit_error,
+    batch_cancel_from_cancel_all, cancels_for_cancel_all, command_failure_from_cancel_error,
+    command_failure_from_futures_batch_error, command_failure_from_futures_batch_item,
+    command_failure_from_modify_error, command_failure_from_submit_error,
 };
 use crate::{
     common::{
@@ -1205,57 +1205,22 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             cmd.order_side
         );
 
-        let orders_to_cancel: Vec<_> = {
+        // The venue's bulk cancellation takes a symbol but no side, so a side-filtered request
+        // cancels the selected orders by ID through the same batch-cancel command an explicit
+        // batch uses.
+        let cancels = {
             let cache = self.core.cache();
-            let open_orders = cache.orders_open(None, Some(&instrument_id), None, None, None);
-
-            open_orders
-                .into_iter()
-                .filter(|order| Some(order.order_side()) == cmd.order_side)
-                .filter_map(|order| {
-                    Some((
-                        order.venue_order_id()?,
-                        order.client_order_id(),
-                        order.instrument_id(),
-                        order.strategy_id(),
-                    ))
-                })
-                .collect()
+            cancels_for_cancel_all(&cache, &cmd, self.core.account_id)
         };
 
-        let account_id = self.core.account_id;
-
-        for (venue_order_id, client_order_id, order_instrument_id, strategy_id) in orders_to_cancel
-        {
-            let http = self.http.clone();
-            let emitter = self.emitter.clone();
-            let clock = self.clock;
-
-            self.spawn_task("cancel_order_by_side", async move {
-                if let Err(failure) = cancel_order_for_futures(
-                    &http,
-                    account_id,
-                    order_instrument_id,
-                    Some(client_order_id),
-                    Some(venue_order_id),
-                )
-                .await
-                {
-                    handle_cancel_failure(
-                        &emitter,
-                        clock,
-                        strategy_id,
-                        order_instrument_id,
-                        client_order_id,
-                        Some(venue_order_id),
-                        failure,
-                    );
-                }
-                Ok(())
-            });
+        if cancels.is_empty() {
+            // The cache is the only source of orders on this path, so an empty selection may mean
+            // the venue holds orders this client has not reconciled rather than none at all.
+            log::warn!("No cached open orders to cancel for {instrument_id}");
+            return Ok(());
         }
 
-        Ok(())
+        self.batch_cancel_orders(batch_cancel_from_cancel_all(&cmd, cancels))
     }
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {

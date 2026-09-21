@@ -35,7 +35,15 @@ mod futures;
 mod spot;
 
 pub use futures::KrakenFuturesExecutionClient;
+use nautilus_common::{
+    cache::Cache,
+    messages::execution::{BatchCancelOrders, CancelAllOrders, CancelOrder},
+};
 use nautilus_live::execution::failure::CommandFailure;
+use nautilus_model::{
+    identifiers::{AccountId, ClientOrderId, StrategyId, VenueOrderId},
+    orders::Order,
+};
 pub use spot::KrakenSpotExecutionClient;
 
 use crate::{
@@ -48,6 +56,83 @@ use crate::{
         spot::models::SpotBatchOrderResponse,
     },
 };
+
+/// Builds the explicit per-order cancels a [`CancelAllOrders`] command selects.
+///
+/// Kraken's account-wide cancel-all reaches orders on instruments the command never named, and
+/// its symbol-scoped form cannot express a side, so both clients resolve the command against the
+/// cache and cancel the selected orders by ID. Each cancel keeps its own order's strategy and
+/// venue order ID so a per-order result can be attributed, and carries the command's tracing
+/// identifiers.
+///
+/// Orders belonging to another account are skipped. The instrument already scopes the selection
+/// to this venue, but a second client on the same venue would otherwise have its orders swept up.
+fn cancels_for_cancel_all(
+    cache: &Cache,
+    cmd: &CancelAllOrders,
+    account_id: AccountId,
+) -> Vec<CancelOrder> {
+    cache
+        .orders_open(None, Some(&cmd.instrument_id), None, None, cmd.order_side)
+        .into_iter()
+        .filter(|order| {
+            order
+                .account_id()
+                .is_none_or(|order_account_id| order_account_id == account_id)
+        })
+        .map(|order| {
+            cancel_from_cancel_all(
+                cmd,
+                order.client_order_id(),
+                order.venue_order_id(),
+                order.strategy_id(),
+            )
+        })
+        .collect()
+}
+
+/// Builds one [`CancelOrder`] for `client_order_id` from a [`CancelAllOrders`] command.
+fn cancel_from_cancel_all(
+    cmd: &CancelAllOrders,
+    client_order_id: ClientOrderId,
+    venue_order_id: Option<VenueOrderId>,
+    strategy_id: StrategyId,
+) -> CancelOrder {
+    CancelOrder {
+        trader_id: cmd.trader_id,
+        client_id: cmd.client_id,
+        strategy_id,
+        instrument_id: cmd.instrument_id,
+        client_order_id,
+        venue_order_id,
+        command_id: cmd.command_id,
+        ts_init: cmd.ts_init,
+        params: cmd.params.clone(),
+        correlation_id: cmd.correlation_id,
+        causation_id: cmd.causation_id,
+    }
+}
+
+/// Builds the [`BatchCancelOrders`] command that cancels `cancels` through the client's own
+/// batch-cancel path, so a cancel-all reaches the venue by the same transport, and honours the
+/// same per-call options, as an explicit batch cancel.
+fn batch_cancel_from_cancel_all(
+    cmd: &CancelAllOrders,
+    cancels: Vec<CancelOrder>,
+) -> BatchCancelOrders {
+    BatchCancelOrders {
+        trader_id: cmd.trader_id,
+        client_id: cmd.client_id,
+        strategy_id: cmd.strategy_id,
+        instrument_id: cmd.instrument_id,
+        cancels,
+        command_id: cmd.command_id,
+        ts_init: cmd.ts_init,
+        params: cmd.params.clone(),
+        correlation_id: cmd.correlation_id.or(Some(cmd.command_id)),
+        causation_id: Some(cmd.command_id),
+    }
+}
 
 fn command_failure_from_submit_error(error: &anyhow::Error) -> CommandFailure {
     for cause in error.chain() {
